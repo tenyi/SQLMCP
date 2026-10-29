@@ -14,11 +14,22 @@ Windows x64，需要 .NET 10 SDK 建置，發佈後不需另外安裝 runtime：
 
 ## 設定
 
-複製 sqlmcp.example.json 至使用者目錄的 .config/sqlmcp/sqlmcp.json，或啟動時傳入 --config 絕對路徑。設定檔不依目前工作目錄搜尋。
+所有設定都寫在 agent 的 MCP 設定（例如 .mcp.json）裡，以環境變數傳入，不另外讀取設定檔。環境變數一律以 `SQLMCP_` 開頭，雙底線 `__` 代表階層：
 
-connections 可設定多組 SQL Server 連線。每組各自設定 connectionString、userName、password 或 passwordEnvironmentVariable；環境變數優先於明文 password。也可在 connectionString 使用 Integrated Security。不要將真實帳密提交到 Git，並限制設定檔的檔案存取權限。
+| 環境變數 | 說明 |
+| --- | --- |
+| `SQLMCP_Connections__<名稱>__ConnectionString` | 必填。SQL Server 連線字串，可使用 Integrated Security |
+| `SQLMCP_Connections__<名稱>__UserName` | SQL 驗證帳號；設定後改用 SQL 驗證 |
+| `SQLMCP_Connections__<名稱>__Password` | 密碼 |
+| `SQLMCP_Connections__<名稱>__PasswordEnvironmentVariable` | 改從另一個環境變數讀取密碼，優先於 Password |
+| `SQLMCP_Connections__<名稱>__MaxRows` | 每個結果集最多回傳筆數，1~10000，預設 100 |
+| `SQLMCP_Connections__<名稱>__TimeoutSeconds` | 指令逾時秒數，1~300，預設 30 |
+| `SQLMCP_Connections__<名稱>__AllowWrite` | `true` 時 execute_sql 可執行寫入與 DDL，預設 `false` |
+| `SQLMCP_Connections__<名稱>__Entities__<別名>__Schema` / `__Table` / `__Columns__0`、`__Columns__1`… | read_records 的實體白名單 |
 
-entities 是允許公開的實體與欄位清單；只公開業務需要的欄位。使用只有 SELECT 權限的資料庫帳號。每個啟動此程序的 agent 都能存取該設定檔列出的所有連線；不同使用者的存取範圍應透過不同設定檔與作業系統權限隔離。stdio 不需要也不另設 HTTP/OAuth 或 MCP 登入帳密。
+`<名稱>` 就是工具的 connection 參數，可設定多組連線。至少要有一組連線，否則程序啟動即失敗。也可改用命令列參數傳入同樣的設定，例如 `--Connections:localhost:ConnectionString=...`。
+
+只公開業務需要的欄位，並使用最小權限的資料庫帳號。每個啟動此程序的 agent 都能存取設定中列出的所有連線。.mcp.json 若會提交到 Git，不要直接寫入密碼；Claude Code 的 .mcp.json 支援 `${變數}` 展開，可寫成 `"SQLMCP_Connections__erp__Password": "${ERP_PASSWORD}"`。stdio 不需要也不另設 HTTP/OAuth 或 MCP 登入帳密。
 
 ## Agent 設定
 
@@ -28,11 +39,18 @@ entities 是允許公開的實體與欄位清單；只公開業務需要的欄�
 {
   "mcpServers": {
     "sql": {
+      "type": "stdio",
       "command": "C:\\Users\\you\\.local\\bin\\sqlmcp.exe",
-      "args": ["--config", "C:\\Users\\you\\.config\\sqlmcp\\sqlmcp.json"],
+      "args": [],
       "env": {
-        "SQLMCP_ERP_PASSWORD": "<ERP 密碼>",
-        "SQLMCP_CRM_PASSWORD": "<CRM 密碼>"
+        "SQLMCP_Connections__localhost__ConnectionString": "Server=localhost;Database=master;Integrated Security=True;Encrypt=True;TrustServerCertificate=True",
+        "SQLMCP_Connections__localhost__AllowWrite": "true",
+        "SQLMCP_Connections__erp__ConnectionString": "Server=erp-db;Database=ERP;Encrypt=True",
+        "SQLMCP_Connections__erp__UserName": "erp_reader",
+        "SQLMCP_Connections__erp__Password": "${ERP_PASSWORD}",
+        "SQLMCP_Connections__erp__Entities__products__Table": "Products",
+        "SQLMCP_Connections__erp__Entities__products__Columns__0": "Id",
+        "SQLMCP_Connections__erp__Entities__products__Columns__1": "Name"
       }
     }
   }
@@ -44,8 +62,14 @@ entities 是允許公開的實體與欄位清單；只公開業務需要的欄�
 - list_connections：只回傳連線名稱。
 - list_entities(connection)：回傳允許的實體別名與欄位。
 - read_records(connection, entity, limit=100)：讀取指定實體，最多 MaxRows 筆，預設 100；不保證排序。支援取消與查詢逾時（timeoutSeconds，預設 30）。
+- list_databases(connection)：列出該 SQL Server 執行個體上的所有資料庫。
+- list_tables(connection, database?)：列出指定資料庫的資料表與檢視表。
+- describe_table(connection, table, database?)：列出資料表欄位、型別與是否可為 NULL。
+- execute_sql(connection, query, database?)：執行任意 SQL（可用 database 切換資料庫），多個結果集會分開回傳，每個結果集最多 MaxRows 筆（超過會標示 truncated），並回傳 rowsAffected。SQL 錯誤會回傳錯誤編號與訊息。
 
-第一版僅提供受控讀取，不包含任意 SQL、篩選、分頁、寫入或預存程序。這些是產品範圍，並非 MCP 協定的限制。資料型別沿用 SqlClient 的 JSON 序列化表示；二進位資料為 Base64。
+execute_sql 預設唯讀：連線未設定 `"allowWrite": true` 時，只接受 SELECT／WITH 開頭的指令，且在交易內執行後一律 rollback。這只是第二道防線，真正的保障仍是資料庫帳號權限；需要 INSERT／UPDATE／DDL 時才為該連線開啟 allowWrite，並搭配最小權限帳號。list_databases、list_tables、describe_table 不受 entities 白名單限制，會看到帳號有權限檢視的所有資料庫與資料表。
+
+read_records 僅提供受控讀取（不含篩選、分頁）；任意 SQL、寫入與預存程序請用 execute_sql（需 allowWrite）。資料型別沿用 SqlClient 的 JSON 序列化表示；二進位資料為 Base64。
 
 ## 驗證
 
