@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sqlmcp": {
+      "type": "stdio",
+      "command": "C:\\Users\\0395\\.local\\bin\\sqlmcp.exe",
+      "args": ["--config", "D:\\Git\\SQLMCP\\sqlmcp.json"]
+    }
+  }
+}

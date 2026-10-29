@@ -1,0 +1,22 @@
+{
+  "connections": {
+    "erp": {
+      "connectionString": "Server=localhost;Database=ERP;Encrypt=True;TrustServerCertificate=False",
+      "userName": "erp_reader",
+      "passwordEnvironmentVariable": "SQLMCP_ERP_PASSWORD",
+      "maxRows": 100,
+      "timeoutSeconds": 30,
+      "entities": {
+        "products": { "schema": "dbo", "table": "Products", "columns": ["Id", "Name"] }
+      }
+    },
+    "crm": {
+      "connectionString": "Server=localhost;Database=CRM;Encrypt=True;TrustServerCertificate=False",
+      "userName": "crm_reader",
+      "passwordEnvironmentVariable": "SQLMCP_CRM_PASSWORD",
+      "entities": {
+        "customers": { "schema": "dbo", "table": "Customers", "columns": ["Id", "Name"] }
+      }
+    }
+  }
+}
