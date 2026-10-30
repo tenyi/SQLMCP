@@ -17,6 +17,7 @@ using ModelContextProtocol.Server;
 
 // 最外層 try：任何啟動階段的失敗（設定缺漏、設定值不合法）
 // 都統一在底下的 catch 回報，並以結束碼 1 離開。
+IHost host;
 try
 {
     // 所有設定都來自啟動本程序時的 MCP 設定（.mcp.json 的 env 與 args），不讀任何設定檔。
@@ -41,9 +42,7 @@ try
     // 註冊 MCP 伺服器：使用 stdio 傳輸（由 agent 啟動本程序並透過標準輸入／輸出溝通），
     // 並從 SqlTools 類別掃描要公開的工具。
     builder.Services.AddMcpServer().WithStdioServerTransport().WithTools<SqlTools>();
-    // 啟動主機並持續執行，直到 stdin 關閉或程序被終止。
-    await builder.Build().RunAsync();
-    return 0;
+    host = builder.Build();
 }
 catch (Exception)
 {
@@ -51,6 +50,21 @@ catch (Exception)
     // 例外訊息可能含有連線字串或密碼片段，所以這裡只輸出固定的提示文字，不輸出例外內容與堆疊。
     Console.Error.WriteLine("啟動失敗。請檢查 MCP 設定中的 SQLMCP_Connections__* 環境變數。");
     return 1;
+}
+
+using (host)
+{
+    try
+    {
+        await host.RunAsync();
+        return 0;
+    }
+    catch (Exception)
+    {
+        // 執行期故障與設定驗證分開回報，且不輸出可能含機密的例外內容。
+        Console.Error.WriteLine("MCP 主機執行失敗，請檢查執行環境與主機日誌。");
+        return 1;
+    }
 }
 
 // 設定的根物件，對應設定來源（環境變數／命令列）最外層的 Connections。
@@ -71,6 +85,8 @@ public sealed class Settings
             if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(db.ConnectionString)
                 || db.MaxRows is < 1 or > 10000 || db.TimeoutSeconds is < 1 or > 300)
                 throw new ArgumentException("無效連線設定");
+            // 只驗證語法，不連線、不讀取密碼環境變數；解析錯誤交由啟動階段統一隱藏機密。
+            _ = new SqlConnectionStringBuilder(db.ConnectionString);
             // 實體層級檢查：schema、table 不可為空，至少要有一個欄位，欄位名稱不可空白且不可重複（不分大小寫）。
             // 這些名稱之後會被組進 SQL，所以在啟動時就先把關。
             foreach (var entity in db.Entities.Values)
@@ -109,11 +125,12 @@ public sealed class Database
         var b = new SqlConnectionStringBuilder(ConnectionString);
         // 有指定使用者名稱時改用 SQL 驗證：關閉 Windows 整合驗證再設定帳號。
         if (UserName is not null) { b.IntegratedSecurity = false; b.UserID = UserName; }
-        // 密碼來源優先順序：環境變數 > 設定中的明文密碼。環境變數不存在時丟出 InvalidOperationException，
-        // 由工具轉成「連線設定或密碼環境變數無效」的通用訊息。
+        // 密碼來源優先順序：環境變數 > 設定中的明文密碼。環境變數不存在時直接丟出 McpException 回報給 agent。
+        // 刻意不用 InvalidOperationException：SqlClient 在連線池逾時、交易已結束等情況也會丟該例外，
+        // 若在工具層一律接住並說成「密碼環境變數無效」會誤導使用者。
         if (PasswordEnvironmentVariable is not null)
             b.Password = Environment.GetEnvironmentVariable(PasswordEnvironmentVariable)
-                ?? throw new InvalidOperationException();
+                ?? throw new McpException("連線設定或密碼環境變數無效。");
         else if (Password is not null) b.Password = Password;
         return b.ConnectionString;
     }
@@ -146,13 +163,15 @@ public sealed class SqlTools(Settings settings)
     // 受控讀取：只能讀設定白名單內的實體與欄位，且筆數不超過 MaxRows。
     // 不接受任何自訂 SQL、篩選或排序，所以即使 agent 被誘導也無法讀到白名單外的資料。
     // cancellationToken 由 SDK 提供，用戶端取消請求時會中止查詢。
-    [McpServerTool(Name = "read_records", ReadOnly = true), Description("讀取允許的實體與欄位。limit 不可超過連線的 MaxRows；結果不保證排序。")]
-    public async Task<string> ReadRecords(string connection, string entity, int limit = 100, CancellationToken cancellationToken = default)
+    [McpServerTool(Name = "read_records", ReadOnly = true), Description("讀取允許的實體與欄位。limit 省略時為連線的 MaxRows，且不可超過 MaxRows；結果不保證排序。")]
+    public async Task<string> ReadRecords(string connection, string entity, int? limit = null, CancellationToken cancellationToken = default)
     {
         // 先驗證連線名稱存在，再驗證實體別名與 limit 範圍，全部通過才會真正連線資料庫。
         var db = GetDatabase(connection);
-        if (!db.Entities.TryGetValue(entity, out var source)) throw new McpException("未知或未授權的實體。");
-        if (limit < 1 || limit > db.MaxRows) throw new McpException($"limit 必須介於 1 與 {db.MaxRows}。");
+        if (!db.Entities.TryGetValue(entity, out var source)) throw new McpException("查詢已阻擋，未執行 SQL：未知或未授權的實體。");
+        // limit 省略時取連線的 MaxRows；不能寫死預設值（例如 100），否則 MaxRows 較小的連線不帶 limit 呼叫一定失敗。
+        var take = limit ?? db.MaxRows;
+        if (take < 1 || take > db.MaxRows) throw new McpException($"查詢已阻擋，未執行 SQL：limit 必須介於 1 與 {db.MaxRows}。");
         try
         {
             // 每次呼叫都建立新連線並在結束時釋放（連線池會重複使用底層連線）。
@@ -163,7 +182,7 @@ public sealed class SqlTools(Settings settings)
             cmd.CommandTimeout = db.TimeoutSeconds;
             // 識別字僅從設定白名單取得並跳脫；筆數使用參數。
             cmd.CommandText = $"SELECT TOP (@limit) {string.Join(",", source.Columns.Select(Quote))} FROM {Quote(source.Schema)}.{Quote(source.Table)}";
-            cmd.Parameters.Add("@limit", System.Data.SqlDbType.Int).Value = limit;
+            cmd.Parameters.Add("@limit", System.Data.SqlDbType.Int).Value = take;
             // 以資料讀取器逐列讀取；欄位索引 i 對應 source.Columns[i]（查詢時依相同順序選取）。
             // DBNull 轉為 JSON null，其餘值沿用 SqlClient 的 GetValue（二進位資料序列化後為 Base64）。
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -179,7 +198,6 @@ public sealed class SqlTools(Settings settings)
         }
         // 資料庫錯誤只回傳通用訊息，不洩漏伺服器位置、帳號等細節。
         catch (SqlException) { throw new McpException("資料庫操作失敗，請檢查連線、實體設定與權限。"); }
-        catch (InvalidOperationException) { throw new McpException("連線設定或密碼環境變數無效。"); }
     }
     // 列出整個 SQL Server 執行個體上的資料庫（sys.databases）。實際可見範圍取決於登入帳號的權限。
     // 傳給 RunQuery 的 database 為 null，表示沿用連線字串指定的資料庫。
@@ -190,20 +208,24 @@ public sealed class SqlTools(Settings settings)
 
     // 列出指定資料庫（database 省略時為連線字串的資料庫）的資料表與檢視表。
     // 查詢固定寫死在程式內，database 只用來切換連線的 Initial Catalog，所以沒有 SQL 注入的疑慮。
-    [McpServerTool(Name = "list_tables", ReadOnly = true), Description("列出指定連線（可指定 database，預設為連線字串的資料庫）中的使用者資料表與檢視表，含 schema 與欄位資訊。")]
+    [McpServerTool(Name = "list_tables", ReadOnly = true), Description("列出指定連線（可指定 database，預設為連線字串的資料庫）中的使用者資料表與檢視表，回傳 schema、名稱與類型；欄位資訊請用 describe_table。")]
     public async Task<string> ListTables(string connection, string? database = null, CancellationToken cancellationToken = default)
         => await RunQuery(GetDatabase(connection), database,
             "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_SCHEMA, TABLE_NAME",
             readOnly: true, cancellationToken);
 
     // 查詢單一資料表的欄位結構。table 可寫 name（預設 schema 為 dbo）或 schema.name。
-    [McpServerTool(Name = "describe_table", ReadOnly = true), Description("列出指定資料表的欄位名稱、型別、長度與是否可為 NULL。table 可寫成 name 或 schema.name。")]
+    [McpServerTool(Name = "describe_table", ReadOnly = true), Description("列出指定資料表的欄位名稱、型別、長度與是否可為 NULL。table 可寫成 name、schema.name 或 [schema].[name]。")]
     public async Task<string> DescribeTable(string connection, string table, string? database = null, CancellationToken cancellationToken = default)
     {
-        // 拆成 schema 與 table；以參數傳入，不拼接進 SQL。
-        // 拆出 schema 與資料表名稱；它們以 SQL 參數（@schema、@table）傳入，不會拼進 SQL 字串。
-        // 限制：資料表名稱本身含 "." 時無法正確拆分。
-        var parts = table.Split('.', 2);
+        // 只在方括號外拆分句點，支援括號內的句點與 ]] 跳脫；名稱仍以 SQL 參數傳入。
+        const string identifier = @"(?:\[(?:[^\]]|\]\])+\]|[^.\[\]\s]+)";
+        var match = System.Text.RegularExpressions.Regex.Match(table,
+            @"\A\s*(?<part>" + identifier + @")\s*(?:\.\s*(?<part>" + identifier + @")\s*)?\z");
+        if (!match.Success)
+            throw new McpException("查詢已阻擋，未執行 SQL：table 必須為 name、schema.name 或 [schema].[name]。");
+        var parts = match.Groups["part"].Captures.Select(c =>
+            c.Value.StartsWith('[') ? c.Value[1..^1].Replace("]]", "]") : c.Value).ToArray();
         var (schema, name) = parts.Length == 2 ? (parts[0], parts[1]) : ("dbo", parts[0]);
         return await RunQuery(GetDatabase(connection), database,
             "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS " +
@@ -214,37 +236,97 @@ public sealed class SqlTools(Settings settings)
 
     // 執行任意 SQL，是本伺服器中權限最大的工具，所以標記 Destructive = true 提醒用戶端需要小心。
     // 是否允許寫入由連線的 AllowWrite 決定，預設只准 SELECT／WITH。
-    [McpServerTool(Name = "execute_sql", Destructive = true), Description("在指定連線執行任意 SQL 指令（database 可切換資料庫）。連線未設定 allowWrite 時僅允許 SELECT／WITH 開頭的查詢。查詢結果最多回傳連線的 MaxRows 筆；多個結果集會分開回傳。")]
+    [McpServerTool(Name = "execute_sql", Destructive = true), Description("在指定連線執行任意 SQL 指令（database 可切換資料庫）。連線未設定 allowWrite 時僅允許 SELECT／WITH 開頭的查詢，且不可包含 COMMIT、ROLLBACK、SAVE、EXEC／EXECUTE。被阻擋時回傳工具錯誤與未執行原因；agent 應向使用者回報，不可自動改用寫入連線繞過。查詢結果最多回傳連線的 MaxRows 筆；多個結果集會分開回傳。rolledBack 表示已回滾，此時 rowsAffected 為 null。")]
     public async Task<string> ExecuteSql(string connection, string query, string? database = null, CancellationToken cancellationToken = default)
     {
         var db = GetDatabase(connection);
         // 空白指令直接拒絕，不送到資料庫。
-        if (string.IsNullOrWhiteSpace(query)) throw new McpException("query 不可為空。");
+        if (string.IsNullOrWhiteSpace(query)) throw new McpException("查詢已阻擋，未執行 SQL：query 不可為空。");
         // 唯讀連線：只接受 SELECT／WITH；真正的保障仍是資料庫帳號權限，這裡再加 rollback 作為第二道防線。
         // readOnly 同時控制兩件事：(1) 事前檢查指令開頭；(2) 執行時包在交易內並一律 rollback。
         var readOnly = !db.AllowWrite;
         if (readOnly && !IsReadOnlyQuery(query))
-            throw new McpException("此連線未啟用 allowWrite，只允許 SELECT／WITH 查詢。");
+            throw new McpException("查詢已阻擋，未執行 SQL：此連線未啟用 allowWrite，只允許 SELECT／WITH 查詢，且不可包含 COMMIT、ROLLBACK、SAVE、EXEC／EXECUTE。請向使用者回報原因；需要寫入時須由使用者確認連線權限，不可自動繞過限制。");
         return await RunQuery(db, database, query, readOnly, cancellationToken);
     }
 
-    // 判斷指令移除註解後，第一個關鍵字是否為 SELECT 或 WITH（沿用 mssql_mcp_server 的判斷方式並補上 WITH）。
-    // 注意這個判斷只看「第一個關鍵字」，並不是完整的 SQL 解析：
-    // 例如 "SELECT 1; DROP TABLE x" 會通過檢查，這時靠 rollback 與資料庫帳號權限擋下。
-    // 因此連線務必使用最小權限的帳號。
+    // 唯讀模式下禁止出現的關鍵字。批次內的 COMMIT／ROLLBACK 會結束用戶端開的交易，
+    // 之後的陳述式就以自動提交執行，使 rollback 防線失效；SAVE TRAN 屬同類交易控制；
+    // EXEC／EXECUTE 可執行動態 SQL（例如 EXEC('COM' + 'MIT')），無法靠關鍵字檢查看穿，所以一併禁止。
+    private static readonly HashSet<string> ForbiddenReadOnlyWords =
+        new(["COMMIT", "ROLLBACK", "SAVE", "EXEC", "EXECUTE"], StringComparer.OrdinalIgnoreCase);
+
+    // 判斷指令在移除註解與字串常值後：(1) 第一個字是 SELECT 或 WITH；(2) 不含任何禁止的關鍵字。
+    // 這仍不是完整的 SQL 解析，例如 "SELECT 1; DROP TABLE x" 會通過，這時靠交易 rollback 擋下；
+    // 而 rollback 能否生效，正是由 (2) 確保批次內沒有交易控制與動態 SQL。
+    // 有外部副作用的查詢（例如 OPENQUERY 到 linked server）仍只能靠資料庫帳號權限限制，連線務必使用最小權限帳號。
     private static bool IsReadOnlyQuery(string query)
     {
-        // 先移除區塊註解 /* ... */（Singleline 讓 . 可以比對換行），避免用註解把真正的指令藏在後面。
-        var cleaned = System.Text.RegularExpressions.Regex.Replace(query, @"/\*.*?\*/", "", System.Text.RegularExpressions.RegexOptions.Singleline);
-        // 再移除單行註解 -- 到行尾。
-        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"--[^\r\n]*", "");
-        // 以空白字元切開並取第一個字；若指令只剩註解或空白則視為空字串（不通過）。
-        var first = cleaned.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-        return first.Equals("SELECT", StringComparison.OrdinalIgnoreCase) || first.Equals("WITH", StringComparison.OrdinalIgnoreCase);
+        // 以 \w+ 取出所有「字」；標點（; ( * 等）自然被略過，所以 ";WITH" 與 "(SELECT" 也取得到關鍵字。
+        var words = System.Text.RegularExpressions.Regex.Matches(StripCommentsAndLiterals(query), @"\w+")
+            .Select(m => m.Value).ToList();
+        // 只剩註解或空白時沒有任何字，視為不通過。
+        if (words.Count == 0) return false;
+        var first = words[0];
+        return (first.Equals("SELECT", StringComparison.OrdinalIgnoreCase) || first.Equals("WITH", StringComparison.OrdinalIgnoreCase))
+            && !words.Any(ForbiddenReadOnlyWords.Contains);
     }
 
-    // 共用的執行流程：開連線（可覆寫資料庫）、執行、把每個結果集轉成 JSON。
-    // readOnly 為 true 時包在交易內並一律 rollback；結果集每個最多讀 MaxRows 筆，超過則標示 truncated。
+    // 依 T-SQL 的詞法把註解、字串常值與引號識別字都換成一個空白，只留下「真正的程式碼」供關鍵字檢查。
+    // 必須用逐字元掃描而不是 regex，原因有二：
+    //   1. SQL Server 的區塊註解可以巢狀（/* /* */ SELECT */ 整段都是註解），非貪婪 regex 會提早結束，
+    //      讓 "/* /* */ SELECT */ DELETE x" 被誤判成 SELECT 開頭。
+    //   2. 註解符號可能出現在字串內（'--'），字串引號也可能出現在註解內，必須依出現順序一起處理。
+    // 移除字串常值與 [識別字] 也能避免 WHERE msg = 'commit' 或欄位 [exec] 被誤判為禁止的關鍵字。
+    // 未結束的註解或字串會吃到結尾；這類指令伺服器本來就會報語法錯誤，這裡只需確保不會誤放行。
+    private static string StripCommentsAndLiterals(string sql)
+    {
+        var sb = new System.Text.StringBuilder(sql.Length);
+        var i = 0;
+        while (i < sql.Length)
+        {
+            var c = sql[i];
+            var next = i + 1 < sql.Length ? sql[i + 1] : '\0';
+            if (c == '-' && next == '-')
+            {
+                // 單行註解：略過到行尾（不含換行字元本身）。
+                while (i < sql.Length && sql[i] is not ('\r' or '\n')) i++;
+                sb.Append(' ');
+            }
+            else if (c == '/' && next == '*')
+            {
+                // 區塊註解：以深度計數處理巢狀，深度回到 0 才結束。
+                var depth = 0;
+                do
+                {
+                    if (sql[i] == '/' && i + 1 < sql.Length && sql[i + 1] == '*') { depth++; i += 2; }
+                    else if (sql[i] == '*' && i + 1 < sql.Length && sql[i + 1] == '/') { depth--; i += 2; }
+                    else i++;
+                } while (depth > 0 && i < sql.Length);
+                sb.Append(' ');
+            }
+            else if (c is '\'' or '"' or '[')
+            {
+                // 字串常值 '...'、引號識別字 "..." 與 [...]：連續兩個結尾符號（'' 、"" 、]]）代表跳脫，不是結尾。
+                var close = c == '[' ? ']' : c;
+                i++;
+                while (i < sql.Length)
+                {
+                    if (sql[i] == close)
+                    {
+                        if (i + 1 < sql.Length && sql[i + 1] == close) { i += 2; continue; }
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+                sb.Append(' ');
+            }
+            else { sb.Append(c); i++; }
+        }
+        return sb.ToString();
+    }
+
     // 所有查詢工具共用的執行流程：連線 → 執行 → 把每個結果集轉成 JSON。
     // 參數說明：
     //   db         連線設定。
@@ -252,7 +334,7 @@ public sealed class SqlTools(Settings settings)
     //   sqlText    要執行的 SQL。
     //   readOnly   true 時包在交易中並一律 rollback。
     //   parameters SQL 參數（名稱, 值），用來避免字串拼接。
-    // 回傳格式：{ "resultSets": [ { "rows": [...], "truncated": bool } ... ], "rowsAffected": int? }
+    // 回傳格式：{ "resultSets": [ { "rows": [...], "truncated": bool } ... ], "rowsAffected": int?, "rolledBack": bool }
     private static async Task<string> RunQuery(Database db, string? database, string sqlText, bool readOnly,
         CancellationToken cancellationToken, params (string Name, object Value)[] parameters)
     {
@@ -300,19 +382,27 @@ public sealed class SqlTools(Settings settings)
             // 單純的 SELECT 也可能回報 -1。
             var affected = reader.RecordsAffected;
             // 唯讀模式明確 rollback，確保即使指令偷偷寫入也不會留下變更。
-            if (tx is not null) await tx.RollbackAsync(cancellationToken); // 唯讀模式不保留任何變更
-            return JsonSerializer.Serialize(new { resultSets, rowsAffected = affected < 0 ? (int?)null : affected });
+            if (tx is not null)
+            {
+                // 最後一道檢查：若交易已被批次內的指令結束（SqlTransaction.Connection 變成 null），
+                // 之後的陳述式可能已自動提交，rollback 不再有效。正常情況下 IsReadOnlyQuery 已擋下這類指令，
+                // 這裡明確回報，而不是讓 RollbackAsync 丟出難以理解的 InvalidOperationException。
+                if (tx.Connection is null)
+                    throw new McpException("唯讀交易已被批次中的指令結束，變更可能已被提交，請立即檢查資料。");
+                await tx.RollbackAsync(cancellationToken);
+            }
+            // 回滾的筆數不代表已儲存變更；僅寫入模式回傳影響筆數，並明確標示是否回滾。
+            return JsonSerializer.Serialize(new { resultSets, rowsAffected = readOnly || affected < 0 ? (int?)null : affected, rolledBack = readOnly });
         }
         // 執行 SQL 的錯誤訊息（語法錯誤、物件不存在等）對使用者除錯是必要的，所以此處回傳訊息本身。
         // 與 read_records 不同，這裡刻意回傳錯誤編號與訊息，否則 agent 無法修正自己寫錯的 SQL。
         // 代價是訊息可能含伺服器端細節，所以請避免讓不受信任的對象使用這支程式。
         catch (SqlException ex) { throw new McpException($"SQL 錯誤 {ex.Number}：{ex.Message}"); }
-        catch (InvalidOperationException) { throw new McpException("連線設定或密碼環境變數無效。"); }
     }
 
-    // 依連線名稱取得設定；找不到時回報「未知或未授權」，不區分兩者以免洩漏哪些名稱存在。
+    // 依連線名稱取得設定；可用名稱由 list_connections 提供，錯誤不包含連線字串或帳密。
     private Database GetDatabase(string name) => settings.Connections.TryGetValue(name, out var db)
-        ? db : throw new McpException("未知或未授權的連線。");
+        ? db : throw new McpException("查詢已阻擋，未執行 SQL：未知或未授權的連線，請用 list_connections 確認可用名稱。");
     // 把識別字（欄位、資料表、schema）包成 [名稱] 並把名稱中的 ] 轉成 ]]，防止識別字注入。
     // 僅用於來自設定白名單的名稱，不用於使用者輸入。
     private static string Quote(string value) => "[" + value.Replace("]", "]]") + "]";

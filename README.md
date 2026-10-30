@@ -29,11 +29,15 @@ Windows x64，需要 .NET 10 SDK 建置，發佈後不需另外安裝 runtime：
 
 `<名稱>` 就是工具的 connection 參數，可設定多組連線。至少要有一組連線，否則程序啟動即失敗。也可改用命令列參數傳入同樣的設定，例如 `--Connections:localhost:ConnectionString=...`。
 
+啟動時會驗證連線字串語法；格式無效即以結束碼 1 離開，不輸出連線字串或密碼。主機執行期間的故障會另行回報，不會一律歸因於設定。
+
 只公開業務需要的欄位，並使用最小權限的資料庫帳號。每個啟動此程序的 agent 都能存取設定中列出的所有連線。.mcp.json 若會提交到 Git，不要直接寫入密碼；Claude Code 的 .mcp.json 支援 `${變數}` 展開，可寫成 `"SQLMCP_Connections__erp__Password": "${ERP_PASSWORD}"`。stdio 不需要也不另設 HTTP/OAuth 或 MCP 登入帳密。
 
 ## Agent 設定
 
 在支援 stdio 的 agent 中設定，例如（路徑請替換成實際絕對路徑，不依賴 agent 展開 HOME）：
+
+儲存庫已包含 `.mcp.json`，供 Claude Code 以 `${USERPROFILE}` 展開 Windows 使用者目錄。此本機開發設定使用 Windows 驗證連到 localhost/master，並明確啟用 `AllowWrite=true`；實際寫入權限沿用啟動 agent 的 Windows 帳號。
 
 ~~~json
 {
@@ -61,13 +65,15 @@ Windows x64，需要 .NET 10 SDK 建置，發佈後不需另外安裝 runtime：
 
 - list_connections：只回傳連線名稱。
 - list_entities(connection)：回傳允許的實體別名與欄位。
-- read_records(connection, entity, limit=100)：讀取指定實體，最多 MaxRows 筆，預設 100；不保證排序。支援取消與查詢逾時（timeoutSeconds，預設 30）。
+- read_records(connection, entity, limit?)：讀取指定實體，最多 MaxRows 筆，limit 省略時為 MaxRows；不保證排序。支援取消與查詢逾時（timeoutSeconds，預設 30）。
 - list_databases(connection)：列出該 SQL Server 執行個體上的所有資料庫。
-- list_tables(connection, database?)：列出指定資料庫的資料表與檢視表。
-- describe_table(connection, table, database?)：列出資料表欄位、型別與是否可為 NULL。
-- execute_sql(connection, query, database?)：執行任意 SQL（可用 database 切換資料庫），多個結果集會分開回傳，每個結果集最多 MaxRows 筆（超過會標示 truncated），並回傳 rowsAffected。SQL 錯誤會回傳錯誤編號與訊息。
+- list_tables(connection, database?)：列出指定資料庫的資料表與檢視表，回傳 schema、名稱與類型。欄位資訊請用 describe_table。
+- describe_table(connection, table, database?)：列出資料表欄位、型別與是否可為 NULL。table 支援 name（預設 dbo）、schema.name、[schema].[name]，包含方括號內的句點與 `]]` 跳脫。
+- execute_sql(connection, query, database?)：執行任意 SQL（可用 database 切換資料庫），多個結果集會分開回傳，每個結果集最多 MaxRows 筆（超過會標示 truncated）。`rolledBack=true` 表示交易已回滾，此時 `rowsAffected=null`；寫入模式為 `rolledBack=false`，`rowsAffected` 為影響筆數（無筆數時為 null）。SQL 錯誤會回傳錯誤編號與訊息。
 
-execute_sql 預設唯讀：連線未設定 `"allowWrite": true` 時，只接受 SELECT／WITH 開頭的指令，且在交易內執行後一律 rollback。這只是第二道防線，真正的保障仍是資料庫帳號權限；需要 INSERT／UPDATE／DDL 時才為該連線開啟 allowWrite，並搭配最小權限帳號。list_databases、list_tables、describe_table 不受 entities 白名單限制，會看到帳號有權限檢視的所有資料庫與資料表。
+前置檢查阻擋查詢時，工具回傳 MCP `isError=true`，訊息明確包含「查詢已阻擋，未執行 SQL」及原因。agent 應向使用者回報原因，不可靜默改用寫入連線或提高權限重試。
+
+execute_sql 預設唯讀：連線未設定 `"allowWrite": true` 時，只接受 SELECT／WITH 開頭的指令（註解、字串常值與引號識別字不列入判斷，支援巢狀區塊註解），不可包含 COMMIT、ROLLBACK、SAVE、EXEC／EXECUTE（避免結束交易或執行動態 SQL 而逃出 rollback），且在交易內執行後一律 rollback。這只是第二道防線，真正的保障仍是資料庫帳號權限；需要 INSERT／UPDATE／DDL 時才為該連線開啟 allowWrite，並搭配最小權限帳號。list_databases、list_tables、describe_table 不受 entities 白名單限制，會看到帳號有權限檢視的所有資料庫與資料表。
 
 read_records 僅提供受控讀取（不含篩選、分頁）；任意 SQL、寫入與預存程序請用 execute_sql（需 allowWrite）。資料型別沿用 SqlClient 的 JSON 序列化表示；二進位資料為 Base64。
 
@@ -80,7 +86,17 @@ dotnet build src/SqlMcp
 dotnet run --project tests/SqlMcp.Smoke
 ~~~
 
-煙霧測試透過真正的 stdio 子程序，以固定 2026-07-28 版本連線，檢查工具探索、連線清單不含機密，以及未授權實體與筆數上限。尚未對實際 SQL Server 驗證登入與讀取。
+需要執行 SQL Server 整合測試時，設定下列環境變數後執行煙霧測試；目標資料庫須有至少一個可見的資料表或檢視表：
+
+~~~powershell
+$env:SQLMCP_SMOKE_CONNECTION_STRING = 'Server=localhost;Database=master;Integrated Security=True;Encrypt=True;TrustServerCertificate=True'
+dotnet run --project tests/SqlMcp.Smoke
+Remove-Item Env:SQLMCP_SMOKE_CONNECTION_STRING
+~~~
+
+整合測試驗證方括號名稱的欄位查詢、唯讀回滾與寫入模式的影響筆數，以及多個結果集；只操作區域資料表變數，不留下資料庫變更。未設定環境變數時會明確印出 SKIP。
+
+煙霧測試透過真正的 stdio 子程序，以固定 2026-07-28 版本連線，檢查工具探索、連線清單不含機密、未授權實體與筆數上限、預設 limit、唯讀查詢阻擋回報、資料表名稱解析，以及無效連線字串在啟動時失敗且不洩漏機密。預設不需真實資料庫；offline 連線會嘗試連到不存在的伺服器，以區分前置阻擋與連線失敗。
 
 ## 開發流程
 

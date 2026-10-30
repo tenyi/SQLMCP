@@ -2,7 +2,7 @@
   "mcpServers": {
     "sqlmcp": {
       "type": "stdio",
-      "command": "C:\\Users\\0395\\.local\\bin\\sqlmcp.exe",
+      "command": "${USERPROFILE}\\.local\\bin\\sqlmcp.exe",
       "args": [],
       "env": {
         "SQLMCP_Connections__localhost__ConnectionString": "Server=localhost;Database=master;Integrated Security=True;Encrypt=True;TrustServerCertificate=True",
