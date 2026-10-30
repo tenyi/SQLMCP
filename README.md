@@ -45,7 +45,7 @@ Windows x64，需要 .NET 10 SDK 建置，發佈後不需另外安裝 runtime：
 
 儲存庫已包含 `.mcp.json`，供 Claude Code 以 `${USERPROFILE}` 展開 Windows 使用者目錄。此本機開發設定使用 Windows 驗證連到 localhost/master，並明確啟用 `AllowWrite=true`；實際寫入權限沿用啟動 agent 的 Windows 帳號。
 
-專案另提供 [sqlmcp skill](skills/sqlmcp/SKILL.md)，說明如何探索資料庫、使用工具及處理唯讀限制。安裝方式見下方「安裝 Skill」。
+專案另提供可攜式 [sqlmcp skill](skills/sqlmcp/SKILL.md)，說明如何探索資料庫、使用工具及處理唯讀限制；完整的 server、MCP 設定與 skill 安裝流程在 [安裝與連接指引](skills/sqlmcp/references/setup.md)。
 
 以下範例包含可寫入的本機連線與預設唯讀的 ERP 連線。請將執行檔路徑與資料庫設定改為實際值；其他 agent 的環境變數展開方式依其設定格式為準。
 
@@ -73,7 +73,7 @@ Windows x64，需要 .NET 10 SDK 建置，發佈後不需另外安裝 runtime：
 
 ## 安裝 Skill
 
-Skill 是 agent 的操作指引，需另外安裝；也須先依上方設定啟用 SQL MCP 伺服器。從本儲存庫根目錄執行以下 PowerShell 指令，將 skill 複製到個人技能目錄：
+Skill 是 agent 的操作指引，需另外安裝；它不包含 `sqlmcp.exe`，也不會自動建立 MCP 連線。須先安裝 server 並依上方設定啟用 SQLMCP。從本儲存庫根目錄執行以下 PowerShell 指令，將整個 skill 資料夾（包含 `references`）複製到個人技能目錄：
 
 Codex：
 
@@ -92,6 +92,10 @@ Copy-Item -Recurse -Force -Path '.\skills\sqlmcp' -Destination $skillRoot
 ~~~
 
 安裝後重新啟動 agent 以載入 skill；更新時再次複製。若目標已有同名 skill，請先確認是否需要保留原有內容。
+
+其他 AI agent 沒有共用的 skill 安裝標準。支援資料夾式 `SKILL.md` 的產品，可將 `skills/sqlmcp` 整個資料夾複製到該產品指定的 skill 目錄；不支援 skill 的產品仍可使用 stdio MCP server，並將 [SKILL.md](skills/sqlmcp/SKILL.md) 放入其專案指引或自訂 instructions。實際位置須依該產品文件設定。
+
+安裝後應先確認七個 SQLMCP 工具存在，再呼叫 `list_connections` 驗證連線。詳細檢查方式與常見設定錯誤見 [安裝與連接指引](skills/sqlmcp/references/setup.md)。
 
 ## 工具
 
