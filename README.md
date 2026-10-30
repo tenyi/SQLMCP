@@ -45,6 +45,8 @@ Windows x64，需要 .NET 10 SDK 建置，發佈後不需另外安裝 runtime：
 
 儲存庫已包含 `.mcp.json`，供 Claude Code 以 `${USERPROFILE}` 展開 Windows 使用者目錄。此本機開發設定使用 Windows 驗證連到 localhost/master，並明確啟用 `AllowWrite=true`；實際寫入權限沿用啟動 agent 的 Windows 帳號。
 
+專案另提供 [sqlmcp skill](skills/sqlmcp/SKILL.md)，說明如何探索資料庫、使用工具及處理唯讀限制。安裝方式見下方「安裝 Skill」。
+
 以下範例包含可寫入的本機連線與預設唯讀的 ERP 連線。請將執行檔路徑與資料庫設定改為實際值；其他 agent 的環境變數展開方式依其設定格式為準。
 
 ~~~json
@@ -68,6 +70,28 @@ Windows x64，需要 .NET 10 SDK 建置，發佈後不需另外安裝 runtime：
   }
 }
 ~~~
+
+## 安裝 Skill
+
+Skill 是 agent 的操作指引，需另外安裝；也須先依上方設定啟用 SQL MCP 伺服器。從本儲存庫根目錄執行以下 PowerShell 指令，將 skill 複製到個人技能目錄：
+
+Codex：
+
+~~~powershell
+$skillRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+New-Item -ItemType Directory -Force -Path (Join-Path $skillRoot 'skills') | Out-Null
+Copy-Item -Recurse -Force -Path '.\skills\sqlmcp' -Destination (Join-Path $skillRoot 'skills')
+~~~
+
+Claude Code：
+
+~~~powershell
+$skillRoot = Join-Path $env:USERPROFILE '.claude\skills'
+New-Item -ItemType Directory -Force -Path $skillRoot | Out-Null
+Copy-Item -Recurse -Force -Path '.\skills\sqlmcp' -Destination $skillRoot
+~~~
+
+安裝後重新啟動 agent 以載入 skill；更新時再次複製。若目標已有同名 skill，請先確認是否需要保留原有內容。
 
 ## 工具
 
