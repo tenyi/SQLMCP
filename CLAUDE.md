@@ -18,17 +18,17 @@ dotnet run --project tests/SqlMcp.Smoke # 唯一的測試；須在儲存庫根�
 
 - 整個伺服器在 `src/SqlMcp/Program.cs` 單一檔案：啟動、設定模型（`Settings`/`Database`/`Entity`）、所有 MCP 工具與 `RunQuery` 輔助函式。新增工具時要同步更新煙霧測試裡的工具清單。
 - stdio transport：stdout 專供 MCP 協定，任何日誌或輸出都必須走 stderr，否則會破壞協定。
-- 設定只來自環境變數（前綴 `SQLMCP_`，`__` 代表階層，例如 `SQLMCP_Connections__localhost__AllowWrite`）或命令列參數，不讀任何設定檔。這是刻意的設計：所有參數都寫在 agent 的 `.mcp.json` 的 `env` 區塊。不要重新引入獨立的 JSON 設定檔。
+- 建議將連線設定放在 agent 的 `.mcp.json` 的 `env` 區塊，使用 `SQLMCP_` 前綴及 `__` 階層分隔符；也支援命令列參數。`Host.CreateApplicationBuilder` 另載入 Generic Host 的預設設定來源，包括 appsettings 檔案與未加前綴的環境變數；`SQLMCP_` 來源在建立 host 後加入。
 - 沒有任何連線時 `Validate()` 會讓程序啟動即失敗（exit code 1）。
 - 兩條讀取路徑：
   - `list_entities` / `read_records`：受 `Entities` 白名單限制的受控讀取。
   - `list_databases` / `list_tables` / `describe_table` / `execute_sql`：不受白名單限制，只受資料庫帳號權限限制。
-- `execute_sql` 在 `AllowWrite=false`（預設）時：以 `StripCommentsAndLiterals`（逐字元掃描，支援巢狀註解）去除註解與字串常值後，只接受 SELECT/WITH 開頭且不含 COMMIT/ROLLBACK/SAVE/EXEC/EXECUTE，並在交易內執行後一律 rollback（交易若已被結束則回報錯誤）；`AllowWrite=true` 時不包交易直接執行。每個結果集最多 `MaxRows` 筆並標示 `truncated`；`SqlException` 轉成保留錯誤編號的 `McpException`。
+- `execute_sql` 在 `AllowWrite=false`（預設）時：掃描巢狀註解並遮蔽字串與引號識別字，保留詞彙位置，只接受 SELECT/WITH 開頭且不含 COMMIT/ROLLBACK/SAVE/EXEC/EXECUTE 關鍵字；變數及暫存表名稱不視為關鍵字。成功執行後回滾交易，交易若已結束則回報錯誤；這不是完整 SQL 解析，仍須依賴資料庫權限。`AllowWrite=true` 時不包交易直接執行。每個結果集最多 `MaxRows` 筆並標示 `truncated`；`SqlException` 轉成保留錯誤編號的 `McpException`。
 - 回傳的 `rolledBack=true` 代表交易已回滾，`rowsAffected` 必須為 null，不可描述成已儲存的變更；寫入模式才回報影響筆數。
 - 查詢遭前置檢查阻擋時，工具必須回傳 `isError=true` 與「查詢已阻擋，未執行 SQL」及原因。agent 必須向使用者回報，不可自動改用寫入連線或提高權限繞過。
 - `describe_table` 支援一般及方括號名稱，包括括號內句點和 `]]` 跳脫，名稱一律以 SQL 參數傳入。
 - 連線字串語法在啟動時驗證，設定失敗與主機執行期故障分開回報，兩者都不直接輸出例外內容。
-- 可設定 `SQLMCP_SMOKE_CONNECTION_STRING` 執行 SQL Server 整合測試（目標資料庫須有可見資料表或檢視表）；只查詢既有結構與操作區域資料表變數，不留下變更。
+- 可設定 `SQLMCP_SMOKE_CONNECTION_STRING` 執行 SQL Server 整合測試；目標資料庫須有可見且名稱可用一般 `schema.table` 表示的資料表或檢視表，並可執行 `sys.sp_executesql`。測試查詢既有結構、操作區域資料表變數並呼叫回傳常數的系統程序，不留下永久變更。
 - 版本固定：ModelContextProtocol C# SDK 2.3.0、MCP 協定 2026-07-28（煙霧測試以此版本連線）。
 
 ## 慣例

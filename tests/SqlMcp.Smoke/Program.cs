@@ -1,6 +1,6 @@
-// 煙霧測試：以真正的 stdio 子程序啟動 SqlMcp，用 MCP 用戶端走一遍協定，驗證不需要真實資料庫的行為。
+// 煙霧測試：以真正的 stdio 子程序啟動 SqlMcp；設定連線字串時另執行 SQL Server 整合測試。
 // 執行方式：先 dotnet build src/SqlMcp，再於儲存庫根目錄執行 dotnet run --project tests/SqlMcp.Smoke。
-// 任何檢查失敗都會丟出例外使程序以非 0 結束，最後印出 PASS 才代表全部通過。
+// 任何檢查失敗都會丟出例外使程序以非 0 結束；整合測試未設定時會印出 SKIP。
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using System.Text.Json;
@@ -35,7 +35,7 @@ var transportOptions = new StdioClientTransportOptions
         ["SQLMCP_Connections__offline__Entities__products__Columns__0"] = "Id",
     }
 };
-// 選擇性整合測試：只查詢既有結構與操作區域資料表變數，不留下資料庫變更。
+// 選擇性整合測試：查詢既有結構、操作區域資料表變數及呼叫回傳常數的系統程序。
 var liveConnectionString = Environment.GetEnvironmentVariable("SQLMCP_SMOKE_CONNECTION_STRING");
 if (!string.IsNullOrWhiteSpace(liveConnectionString))
 {
@@ -96,6 +96,15 @@ foreach (var query in new[]
     "SELECT 1; SAVE TRANSACTION point",
     "SELECT 1; EXEC('DELETE FROM x')",
     "WITH a AS (SELECT 1 AS n) SELECT n FROM a; execute sp_who",
+    // 預存程序在批次首句可省略 EXEC；後面的 SELECT 不可讓它通過檢查。
+    "[dbo].[DoWork]; SELECT 1",
+    "\"dbo\".\"DoWork\"; SELECT 1",
+    "/* comment */ [dbo].[DoWork] @select = 1",
+    "[SELECT]; SELECT 1",
+    "SELECT$DoWork; SELECT 1",
+    // 允許變數名稱不代表可以漏掉真正的交易控制。
+    "SELECT 1; DECLARE @commit int = 1; COMMIT;",
+    "SELECT 1; DECLARE @rollback int = 1; ROLLBACK;",
 })
 {
     var result = await client.CallToolAsync("execute_sql",
@@ -113,6 +122,9 @@ foreach (var query in new[]
     "SELECT 'commit' AS [exec], \"rollback\" FROM t -- EXEC x",
     "SELECT '--' + 'x' /* COMMIT /* nested */ */",
     ";WITH a AS (SELECT 1 AS n) SELECT n FROM a",
+    "SELECT 1; DECLARE @commit int = 1; SELECT @commit;",
+    "SELECT 1; DECLARE @rollback int = 1, @save int = 2, @exec int = 3, @execute int = 4; SELECT @rollback, @save, @exec, @execute;",
+    "SELECT 1 AS n INTO #commit; SELECT n FROM #commit;",
 })
 {
     var result = await client.CallToolAsync("execute_sql",
@@ -196,7 +208,40 @@ if (!string.IsNullOrWhiteSpace(liveConnectionString))
             || root.GetProperty("resultSets").GetArrayLength() != 2)
             throw new Exception("回滾狀態、影響筆數或多結果集回報錯誤");
     }
-    Console.WriteLine("PASS: SQL Server 整合測試，方括號欄位查詢、回滾與寫入模式的影響筆數、多結果集。");
+    // 用只回傳常數的系統程序驗證 P1：同一批次在唯讀模式必須阻擋，寫入模式則可正常呼叫。
+    const string implicitProcedure = "[sys].[sp_executesql] N'SELECT 42 AS n'; SELECT 1 AS tail;";
+    var blockedProcedure = await client.CallToolAsync("execute_sql", new Dictionary<string, object?>
+    {
+        ["connection"] = "live", ["query"] = implicitProcedure
+    }, cancellationToken: timeout.Token);
+    if (blockedProcedure.IsError != true || !TextOf(blockedProcedure).Contains("查詢已阻擋，未執行 SQL"))
+        throw new Exception("唯讀連線未阻擋隱含預存程序呼叫");
+    var allowedProcedure = await client.CallToolAsync("execute_sql", new Dictionary<string, object?>
+    {
+        ["connection"] = "live_write", ["query"] = implicitProcedure
+    }, cancellationToken: timeout.Token);
+    if (allowedProcedure.IsError == true) throw new Exception($"寫入連線無法呼叫預存程序：{TextOf(allowedProcedure)}");
+    using var procedureJson = JsonDocument.Parse(TextOf(allowedProcedure));
+    var procedureSets = procedureJson.RootElement.GetProperty("resultSets");
+    if (procedureSets.GetArrayLength() != 2
+        || procedureSets[0].GetProperty("rows")[0].GetProperty("n").GetInt32() != 42
+        || procedureSets[1].GetProperty("rows")[0].GetProperty("tail").GetInt32() != 1
+        || procedureJson.RootElement.GetProperty("rolledBack").GetBoolean())
+        throw new Exception("隱含預存程序的結果或寫入模式狀態不正確");
+
+    // P2 必須實際執行成功，不能只驗證通過前置檢查；同時涵蓋所有禁止關鍵字的變數名稱。
+    var variables = await client.CallToolAsync("execute_sql", new Dictionary<string, object?>
+    {
+        ["connection"] = "live",
+        ["query"] = "SELECT 1 AS initial; DECLARE @commit int = 1, @rollback int = 2, @save int = 3, @exec int = 4, @execute int = 5; SELECT @commit + @rollback + @save + @exec + @execute AS total;"
+    }, cancellationToken: timeout.Token);
+    if (variables.IsError == true) throw new Exception($"關鍵字變數查詢失敗：{TextOf(variables)}");
+    using var variableJson = JsonDocument.Parse(TextOf(variables));
+    if (variableJson.RootElement.GetProperty("resultSets")[1].GetProperty("rows")[0].GetProperty("total").GetInt32() != 15
+        || !variableJson.RootElement.GetProperty("rolledBack").GetBoolean()
+        || variableJson.RootElement.GetProperty("rowsAffected").ValueKind != JsonValueKind.Null)
+        throw new Exception("關鍵字變數查詢的結果或唯讀回滾狀態不正確");
+    Console.WriteLine("PASS: SQL Server 整合測試，方括號欄位查詢、回滾與寫入模式的影響筆數、多結果集、P1 隱含程序呼叫與 P2 關鍵字變數。");
 }
 else Console.WriteLine("SKIP: 未設定 SQLMCP_SMOKE_CONNECTION_STRING，略過 SQL Server 整合測試。");
 Console.WriteLine("PASS: MCP 2026-07-28 stdio、工具探索、機密隔離與讀取限制、預設 limit、唯讀阻擋回報、資料表名稱與啟動設定驗證。");

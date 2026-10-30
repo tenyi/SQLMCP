@@ -20,7 +20,7 @@ using ModelContextProtocol.Server;
 IHost host;
 try
 {
-    // 所有設定都來自啟動本程序時的 MCP 設定（.mcp.json 的 env 與 args），不讀任何設定檔。
+    // Generic Host 也會載入預設設定來源（包含 appsettings 與環境變數）；另加入 SQLMCP_ 前綴環境變數。
     // 這裡傳入 args，所以命令列參數（--Connections:名稱:ConnectionString=...）也會成為設定來源。
     // 建立 .NET Generic Host，用來承載 MCP 伺服器與相依性注入。
     var builder = Host.CreateApplicationBuilder(args);
@@ -256,29 +256,30 @@ public sealed class SqlTools(Settings settings)
     private static readonly HashSet<string> ForbiddenReadOnlyWords =
         new(["COMMIT", "ROLLBACK", "SAVE", "EXEC", "EXECUTE"], StringComparer.OrdinalIgnoreCase);
 
-    // 判斷指令在移除註解與字串常值後：(1) 第一個字是 SELECT 或 WITH；(2) 不含任何禁止的關鍵字。
+    // 忽略註解並遮蔽字串及引號識別字後，檢查首個有效詞彙與禁止關鍵字。
     // 這仍不是完整的 SQL 解析，例如 "SELECT 1; DROP TABLE x" 會通過，這時靠交易 rollback 擋下；
-    // 而 rollback 能否生效，正是由 (2) 確保批次內沒有交易控制與動態 SQL。
+    // 這是補充防護，不能保證所有副作用均可回滾，仍須使用最小權限帳號。
     // 有外部副作用的查詢（例如 OPENQUERY 到 linked server）仍只能靠資料庫帳號權限限制，連線務必使用最小權限帳號。
     private static bool IsReadOnlyQuery(string query)
     {
-        // 以 \w+ 取出所有「字」；標點（; ( * 等）自然被略過，所以 ";WITH" 與 "(SELECT" 也取得到關鍵字。
-        var words = System.Text.RegularExpressions.Regex.Matches(StripCommentsAndLiterals(query), @"\w+")
+        // 保留標點與被遮蔽內容的位置，避免略過程序名稱後，把後面的 SELECT 當成批次開頭。
+        // @變數、#暫存表與含 $ 的識別字必須視為完整詞彙，不可拆出其中的 SQL 關鍵字。
+        var tokens = System.Text.RegularExpressions.Regex.Matches(StripCommentsAndLiterals(query), @"[@#\w][\w@$#]*|[^\s]")
             .Select(m => m.Value).ToList();
-        // 只剩註解或空白時沒有任何字，視為不通過。
-        if (words.Count == 0) return false;
-        var first = words[0];
+        // 只允許略過前導分號與左括號，支援 ;WITH 與 (SELECT；其他內容均須保留。
+        var first = tokens.SkipWhile(t => t is ";" or "(").FirstOrDefault();
+        if (first is null) return false;
         return (first.Equals("SELECT", StringComparison.OrdinalIgnoreCase) || first.Equals("WITH", StringComparison.OrdinalIgnoreCase))
-            && !words.Any(ForbiddenReadOnlyWords.Contains);
+            && !tokens.Any(ForbiddenReadOnlyWords.Contains);
     }
 
-    // 依 T-SQL 的詞法把註解、字串常值與引號識別字都換成一個空白，只留下「真正的程式碼」供關鍵字檢查。
+    // 註解換成空白；字串常值與引號識別字換成不會被當成關鍵字的佔位符。
     // 必須用逐字元掃描而不是 regex，原因有二：
     //   1. SQL Server 的區塊註解可以巢狀（/* /* */ SELECT */ 整段都是註解），非貪婪 regex 會提早結束，
     //      讓 "/* /* */ SELECT */ DELETE x" 被誤判成 SELECT 開頭。
     //   2. 註解符號可能出現在字串內（'--'），字串引號也可能出現在註解內，必須依出現順序一起處理。
-    // 移除字串常值與 [識別字] 也能避免 WHERE msg = 'commit' 或欄位 [exec] 被誤判為禁止的關鍵字。
-    // 未結束的註解或字串會吃到結尾；這類指令伺服器本來就會報語法錯誤，這裡只需確保不會誤放行。
+    // 遮蔽字串常值與 [識別字] 能避免誤擋 'commit' 或 [exec]，同時保留首句的詞彙位置。
+    // 未結束的註解或字串會吃到結尾；語法是否有效仍由 SQL Server 判定。
     private static string StripCommentsAndLiterals(string sql)
     {
         var sb = new System.Text.StringBuilder(sql.Length);
@@ -320,7 +321,7 @@ public sealed class SqlTools(Settings settings)
                     }
                     i++;
                 }
-                sb.Append(' ');
+                sb.Append(" ? ");
             }
             else { sb.Append(c); i++; }
         }
