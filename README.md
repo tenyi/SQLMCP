@@ -105,7 +105,7 @@ Copy-Item -Recurse -Force -Path '.\skills\sqlmcp' -Destination $skillRoot
 - list_databases(connection)：列出該 SQL Server 執行個體上的所有資料庫。
 - list_tables(connection, database?)：列出指定資料庫的資料表與檢視表，回傳 schema、名稱與類型。欄位資訊請用 describe_table。
 - describe_table(connection, table, database?)：列出資料表欄位、型別與是否可為 NULL。table 支援 name（預設 dbo）、schema.name、[schema].[name]，包含方括號內的句點與 `]]` 跳脫。
-- execute_sql(connection, query, database?)：執行任意 SQL（可用 database 切換資料庫），多個結果集會分開回傳，每個結果集最多 MaxRows 筆（超過會標示 truncated）。`rolledBack=true` 表示交易已回滾，此時 `rowsAffected=null`；寫入模式為 `rolledBack=false`，`rowsAffected` 為影響筆數（無筆數時為 null）。SQL 錯誤會回傳錯誤編號與訊息。
+- execute_sql(connection, query, database?)：執行任意 SQL（可用 database 切換資料庫），多個結果集會分開回傳，每個結果集最多 MaxRows 筆（超過會標示 truncated）。`rolledBack=true` 表示交易已回滾，此時 `rowsAffected=null`；寫入模式為 `rolledBack=false`，`rowsAffected` 為影響筆數（無筆數時為 null）。未命名欄位以 `column<序號>` 命名，重複欄位名稱依序加上 `_2`、`_3`…。SQL 錯誤會回傳錯誤編號與訊息；連線或開啟資料庫失敗時只回傳錯誤編號與通用說明，不包含登入帳號等細節。
 
 前置檢查阻擋查詢時，工具回傳 MCP `isError=true`，訊息明確包含「查詢已阻擋，未執行 SQL」及原因。agent 應向使用者回報原因，不可靜默改用寫入連線或提高權限重試。
 

@@ -264,7 +264,12 @@ public sealed class SqlTools(Settings settings)
     {
         // 保留標點與被遮蔽內容的位置，避免略過程序名稱後，把後面的 SELECT 當成批次開頭。
         // @變數、#暫存表與含 $ 的識別字必須視為完整詞彙，不可拆出其中的 SQL 關鍵字。
-        var tokens = System.Text.RegularExpressions.Regex.Matches(StripCommentsAndLiterals(query), @"[@#\w][\w@$#]*|[^\s]")
+        // 數字常值必須獨立成詞彙：SQL Server 會把 1COMMIT 拆成數字 1 與 COMMIT、把 0x0ROLLBACK 拆成
+        // 二進位常值 0x0 與 ROLLBACK；若把數字與後面的字母併成一個詞彙，禁止關鍵字就會被藏起來。
+        // 因此依序比對：二進位常值（0x 加十六進位數字，與 SQL Server 一樣盡量吃掉十六進位字元）、
+        // 十進位數字、@／# 開頭的變數與暫存表、字母或底線開頭的識別字，其餘非空白字元各自成一個詞彙。
+        var tokens = System.Text.RegularExpressions.Regex.Matches(StripCommentsAndLiterals(query),
+                @"0[xX][0-9a-fA-F]*|\d+|[@#][\w@$#]*|[\p{L}_][\w@$#]*|[^\s]")
             .Select(m => m.Value).ToList();
         // 只允許略過前導分號與左括號，支援 ;WITH 與 (SELECT；其他內容均須保留。
         var first = tokens.SkipWhile(t => t is ";" or "(").FirstOrDefault();
@@ -346,7 +351,11 @@ public sealed class SqlTools(Settings settings)
             // 資料庫名稱經由連線字串建構器設定，會被正確跳脫，不會被當成額外的連線參數。
             if (!string.IsNullOrWhiteSpace(database)) builder.InitialCatalog = database;
             await using var sql = new SqlConnection(builder.ConnectionString);
-            await sql.OpenAsync(cancellationToken);
+            try { await sql.OpenAsync(cancellationToken); }
+            // 連線／登入階段的錯誤訊息可能含登入帳號（例如 Login failed for user 'xxx'）或伺服器細節，
+            // 而且與 agent 撰寫的 SQL 無關，所以只回傳錯誤編號與通用說明；保留「SQL 錯誤」前綴，
+            // 讓呼叫端仍能分辨「已通過前置檢查、失敗於資料庫」與「被前置檢查阻擋」。
+            catch (SqlException ex) { throw new McpException($"SQL 錯誤 {ex.Number}：無法連線或開啟資料庫，請檢查連線設定、database 名稱與權限。"); }
             // 唯讀時開啟交易（結束時若未提交，Dispose 也會自動 rollback）；寫入模式則不使用交易，
             // 指令各自自動提交，這與原本 Python 版 mssql_mcp_server 的行為一致。
             await using var tx = readOnly ? (SqlTransaction)await sql.BeginTransactionAsync(cancellationToken) : null;
@@ -365,6 +374,20 @@ public sealed class SqlTools(Settings settings)
                 // FieldCount 為 0 代表此段是 INSERT／UPDATE／DDL 等不回傳資料列的陳述式。
                 if (reader.FieldCount == 0) continue;
                 var rows = new List<Dictionary<string, object?>>();
+                // 欄位名稱取自結果集本身（因為 execute_sql 的欄位事先未知），每個結果集先算好一次。
+                // 未命名欄位（例如 SELECT 1, COUNT(*)）的名稱是空字串，同名欄位（例如 JOIN 後的兩個 Id）也會重複；
+                // 直接當字典鍵會讓後者覆蓋前者、資料靜默遺失。因此空名稱改為 column{序號（從 1 起算）}，
+                // 重複名稱依序加上 _2、_3…，直到不分大小寫都不重複為止。
+                var names = new string[reader.FieldCount];
+                var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < names.Length; i++)
+                {
+                    var baseName = reader.GetName(i);
+                    if (string.IsNullOrEmpty(baseName)) baseName = $"column{i + 1}";
+                    var candidate = baseName;
+                    for (var n = 2; !used.Add(candidate); n++) candidate = $"{baseName}_{n}";
+                    names[i] = candidate;
+                }
                 // 每個結果集各自限制 MaxRows 筆；超過就停止讀取並標示 truncated，避免一次載入過大的結果。
                 var truncated = false;
                 while (await reader.ReadAsync(cancellationToken))
@@ -372,8 +395,7 @@ public sealed class SqlTools(Settings settings)
                     if (rows.Count >= db.MaxRows) { truncated = true; break; }
                     var row = new Dictionary<string, object?>();
                     for (int i = 0; i < reader.FieldCount; i++)
-                        // 欄位名稱取自結果集本身（因為 execute_sql 的欄位事先未知）。注意：若 SQL 有重複的欄位別名，後者會覆蓋前者。
-                        row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        row[names[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
                     rows.Add(row);
                 }
                 resultSets.Add(new { rows, truncated });
