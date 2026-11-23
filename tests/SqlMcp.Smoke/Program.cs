@@ -105,6 +105,12 @@ foreach (var query in new[]
     // 允許變數名稱不代表可以漏掉真正的交易控制。
     "SELECT 1; DECLARE @commit int = 1; COMMIT;",
     "SELECT 1; DECLARE @rollback int = 1; ROLLBACK;",
+    // SQL Server 會把數字常值與後面的關鍵字拆開（1COMMIT → 1 COMMIT、0x0ROLLBACK → 0x0 ROLLBACK），
+    // 前置檢查不可把它們當成單一識別字而放行。
+    "SELECT 1COMMIT; DELETE FROM x",
+    "SELECT 1ROLLBACK; DELETE FROM x",
+    "SELECT 0x0ROLLBACK; DELETE FROM x",
+    "SELECT 1SAVE TRANSACTION point",
 })
 {
     var result = await client.CallToolAsync("execute_sql",
@@ -125,12 +131,17 @@ foreach (var query in new[]
     "SELECT 1; DECLARE @commit int = 1; SELECT @commit;",
     "SELECT 1; DECLARE @rollback int = 1, @save int = 2, @exec int = 3, @execute int = 4; SELECT @rollback, @save, @exec, @execute;",
     "SELECT 1 AS n INTO #commit; SELECT n FROM #commit;",
+    // 數字獨立成詞彙後，二進位與科學記號常值仍須正常通過。
+    "SELECT 0x0C AS c, 1E5 AS e, column1 FROM t",
 })
 {
     var result = await client.CallToolAsync("execute_sql",
         new Dictionary<string, object?> { ["connection"] = "offline", ["query"] = query }, cancellationToken: timeout.Token);
     if (result.IsError != true || !TextOf(result).Contains("SQL 錯誤"))
         throw new Exception($"合法查詢未通過檢查進入連線階段：{query}：{TextOf(result)}");
+    // 連線階段的錯誤只回傳編號與通用說明，不可帶出登入帳號等 SqlClient 原始訊息。
+    if (!TextOf(result).Contains("無法連線或開啟資料庫") || TextOf(result).Contains("offline_reader"))
+        throw new Exception($"連線失敗未以通用訊息回報：{TextOf(result)}");
 }
 // 不完整括號或超過兩段的名稱不得默默查詢錯誤物件。
 foreach (var table in new[] { "[dbo].[Orders", "dbo.Orders.extra", "", "[]", "dbo..Orders" })
@@ -241,7 +252,30 @@ if (!string.IsNullOrWhiteSpace(liveConnectionString))
         || !variableJson.RootElement.GetProperty("rolledBack").GetBoolean()
         || variableJson.RootElement.GetProperty("rowsAffected").ValueKind != JsonValueKind.Null)
         throw new Exception("關鍵字變數查詢的結果或唯讀回滾狀態不正確");
-    Console.WriteLine("PASS: SQL Server 整合測試，方括號欄位查詢、回滾與寫入模式的影響筆數、多結果集、P1 隱含程序呼叫與 P2 關鍵字變數。");
+
+    // 未命名與重複名稱的欄位不可互相覆蓋：空名稱改為 column{序號}，重複名稱加 _2、_3…（不分大小寫）。
+    var unnamed = await client.CallToolAsync("execute_sql", new Dictionary<string, object?>
+    {
+        ["connection"] = "live", ["query"] = "SELECT 1, 2 AS a, 3 AS A, 4 AS a, 5;"
+    }, cancellationToken: timeout.Token);
+    if (unnamed.IsError == true) throw new Exception($"未命名欄位查詢失敗：{TextOf(unnamed)}");
+    using var unnamedJson = JsonDocument.Parse(TextOf(unnamed));
+    var unnamedRow = unnamedJson.RootElement.GetProperty("resultSets")[0].GetProperty("rows")[0];
+    if (unnamedRow.EnumerateObject().Count() != 5
+        || unnamedRow.GetProperty("column1").GetInt32() != 1 || unnamedRow.GetProperty("a").GetInt32() != 2
+        || unnamedRow.GetProperty("A_2").GetInt32() != 3 || unnamedRow.GetProperty("a_3").GetInt32() != 4
+        || unnamedRow.GetProperty("column5").GetInt32() != 5)
+        throw new Exception($"未命名或重複欄位被覆蓋：{TextOf(unnamed)}");
+
+    // 不存在的資料庫會在登入階段失敗；錯誤不可帶出 SqlClient 原始訊息（其中含登入帳號）。
+    var missingDb = await client.CallToolAsync("list_tables", new Dictionary<string, object?>
+    {
+        ["connection"] = "live", ["database"] = "SqlMcpSmokeNoSuchDatabase"
+    }, cancellationToken: timeout.Token);
+    if (missingDb.IsError != true || !TextOf(missingDb).Contains("無法連線或開啟資料庫")
+        || TextOf(missingDb).Contains("SqlMcpSmokeNoSuchDatabase") || TextOf(missingDb).Contains("login", StringComparison.OrdinalIgnoreCase))
+        throw new Exception($"開啟不存在的資料庫時未以通用訊息回報：{TextOf(missingDb)}");
+    Console.WriteLine("PASS: SQL Server 整合測試，方括號欄位查詢、回滾與寫入模式的影響筆數、多結果集、P1 隱含程序呼叫、P2 關鍵字變數、未命名欄位與連線錯誤遮蔽。");
 }
 else Console.WriteLine("SKIP: 未設定 SQLMCP_SMOKE_CONNECTION_STRING，略過 SQL Server 整合測試。");
 Console.WriteLine("PASS: MCP 2026-07-28 stdio、工具探索、機密隔離與讀取限制、預設 limit、唯讀阻擋回報、資料表名稱與啟動設定驗證。");

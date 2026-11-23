@@ -65,7 +65,8 @@ SQLMCP 是本機 stdio MCP server。Skill 只提供操作指引，不包含執�
 
 ## 解讀結果與錯誤
 
-- `resultSets` 依 SQL 產生順序排列；每個結果集各自包含 `rows` 與 `truncated`。
+- `resultSets` 依 SQL 產生順序排列；每個結果集各自包含 `rows` 與 `truncated`。未命名欄位會命名為 `column<序號>`，重複名稱會加上 `_2`、`_3`…；需要穩定的欄位名稱時請自行加別名。
+- 「無法連線或開啟資料庫」代表連線、登入或 `database` 名稱有問題，不是 SQL 語法錯誤；先用 `list_databases` 確認名稱，再向使用者回報。
 - `rowsAffected` 只代表寫入模式下 SQL Server 回報的影響筆數；沒有影響筆數時可能是 null。
 - SQL 語法或物件錯誤會回傳 `SQL 錯誤 <編號>：<訊息>`。依訊息修正查詢；物件或欄位不存在時重新探索結構。
 - 未知連線、未授權 entity、limit 超限與唯讀限制會在送出 SQL 前回傳工具錯誤。
