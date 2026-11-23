@@ -184,6 +184,45 @@ foreach (var connectionString in new[] { "Server=localhost;Password=secret-do-no
         throw new Exception("無效連線字串未在啟動時安全地失敗");
 }
 
+// 驗證 client 離開後伺服器會自動結束、不殘留程序：
+// agent 結束時會關閉 stdin，伺服器讀到 EOF 後必須停止主機並以結束碼 0 離開。
+// 用獨立程序（而非上面的 McpClient）才能直接控制 stdin 並觀察結束碼。
+{
+    var start = new ProcessStartInfo("dotnet")
+    {
+        RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+        UseShellExecute = false, CreateNoWindow = true
+    };
+    start.ArgumentList.Add(Path.GetFullPath("src/SqlMcp/bin/Debug/net10.0/SqlMcp.dll"));
+    foreach (var key in start.Environment.Keys.Where(k => k.StartsWith("SQLMCP_", StringComparison.OrdinalIgnoreCase)).ToArray())
+        start.Environment.Remove(key);
+    start.Environment["SQLMCP_Connections__offline__ConnectionString"] = "Server=127.0.0.1,1;Database=ERP;Connect Timeout=1;Encrypt=True";
+    using var process = Process.Start(start)!;
+    // 日誌全部寫到 stderr，必須持續讀走，否則緩衝區滿了會讓伺服器卡住、誤判為不會結束。
+    var stderrTask = process.StandardError.ReadToEndAsync(timeout.Token);
+    try
+    {
+        // 先完成一次 initialize，確認是在「已建立工作階段」的狀態下關閉，而不是啟動途中。
+        // 這裡手寫 JSON-RPC，所以使用走 initialize 交握的 2025-06-18；2026-07-28 不經由 initialize 交握。
+        await process.StandardInput.WriteLineAsync(
+            """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-shutdown","version":"1.0"}}}""");
+        await process.StandardInput.FlushAsync();
+        var response = await process.StandardOutput.ReadLineAsync(timeout.Token);
+        if (response is null || !response.Contains("\"result\""))
+            throw new Exception($"關閉測試的 initialize 失敗：{response}");
+        // 模擬 agent 離開：關閉 stdin，伺服器應在 10 秒內自行結束。
+        process.StandardInput.Close();
+        using var exitTimeout = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        exitTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+        try { await process.WaitForExitAsync(exitTimeout.Token); }
+        catch (OperationCanceledException) { throw new Exception("關閉 stdin 後伺服器未自動結束，會殘留程序"); }
+        if (process.ExitCode != 0)
+            throw new Exception($"關閉 stdin 後伺服器結束碼不是 0：{process.ExitCode}");
+    }
+    finally { if (!process.HasExited) process.Kill(entireProcessTree: true); }
+    await stderrTask;
+}
+
 if (!string.IsNullOrWhiteSpace(liveConnectionString))
 {
     var tables = await client.CallToolAsync("list_tables",
@@ -278,5 +317,5 @@ if (!string.IsNullOrWhiteSpace(liveConnectionString))
     Console.WriteLine("PASS: SQL Server 整合測試，方括號欄位查詢、回滾與寫入模式的影響筆數、多結果集、P1 隱含程序呼叫、P2 關鍵字變數、未命名欄位與連線錯誤遮蔽。");
 }
 else Console.WriteLine("SKIP: 未設定 SQLMCP_SMOKE_CONNECTION_STRING，略過 SQL Server 整合測試。");
-Console.WriteLine("PASS: MCP 2026-07-28 stdio、工具探索、機密隔離與讀取限制、預設 limit、唯讀阻擋回報、資料表名稱與啟動設定驗證。");
+Console.WriteLine("PASS: MCP 2026-07-28 stdio、工具探索、機密隔離與讀取限制、預設 limit、唯讀阻擋回報、資料表名稱、啟動設定驗證與 stdin 關閉後自動結束。");
 

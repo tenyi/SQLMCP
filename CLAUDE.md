@@ -12,7 +12,7 @@ dotnet run --project tests/SqlMcp.Smoke # 唯一的測試；須在儲存庫根�
 
 - 沒有測試框架，沒有單一測試可挑選執行；煙霧測試是一支依序檢查的程式，先 build 再跑，否則測到的是舊的 `SqlMcp.dll`。
 - 煙霧測試預設不需真實資料庫，驗證工具探索、機密不外洩、白名單、筆數上限與 execute_sql 唯讀拒絕。`offline` 連線指向 127.0.0.1:1 並設 1 秒逾時，用來驗證「通過前置檢查、失敗於連線」的路徑；實際 SQL Server 行為由選擇性整合測試驗證。
-- Claude Code 執行中會鎖住 `~/.local/bin/sqlmcp.exe`，`install.ps1` 會失敗；需請使用者關閉 Claude Code 後安裝並重啟，新版工具才會生效。
+- Claude Code 執行中會鎖住 `~/.local/bin/sqlmcp.exe`；`install.ps1` 會先把它改名為 `sqlmcp.exe.<時間戳>.old` 再發佈，因此不需關閉 Claude Code。已在執行的 session 仍使用舊版，需重啟才會生效；被鎖住的 `.old` 留待下次安裝時清除。
 
 ## 架構
 
